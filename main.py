@@ -28,7 +28,7 @@ class Neo4jClient:
             nodes = []
             for record in nodes_result:
                 n = record["n"]
-                n_uuid = n.get("uuid", str(n.id))
+                n_uuid = n.get("uuid", str(n.element_id))
                 n_label = n.get("label", n_uuid)
                 n_props = dict(n.items())
                 nodes.append({
@@ -43,8 +43,8 @@ class Neo4jClient:
                 r = record["r"]
                 a = record["a"]
                 b = record["b"]
-                a_uuid = a.get("uuid", str(a.id))
-                b_uuid = b.get("uuid", str(b.id))
+                a_uuid = a.get("uuid", str(a.element_id))
+                b_uuid = b.get("uuid", str(b.element_id))
                 rels.append({
                     "from": a_uuid,
                     "to": b_uuid,
@@ -129,23 +129,27 @@ class PropertyEditor(QWidget):
         self.fields.append((key_edit, val_edit))
 
     def get_properties(self):
+        # Принудительно снимаем фокус с всех полей, чтобы QLineEdit обновил значения
+        for k, v in self.fields:
+            k.clearFocus()
+            v.clearFocus()
         return {k.text(): v.text() for k, v in self.fields if k.text()}
 
 
 # ---------------------------
-# Диалоги узлов и связей
+# Диалог редактирования узла
 # ---------------------------
 class NodeDialog(QDialog):
-    def __init__(self, node_uuid, node_label=None, node_props=None, parent=None):
+    def __init__(self, node_id, node_label=None, node_props=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Узел {node_uuid}")
+        self.setWindowTitle(f"Узел {node_id}")
         layout = QVBoxLayout(self)
 
-        props = node_props or {}
+        props = node_props or {"тип": "Person"}
         self.editor = PropertyEditor(props)
         layout.addWidget(self.editor)
 
-        self.label_edit = QLineEdit(node_label or "")
+        self.label_edit = QLineEdit(node_label or f"Node {node_id}")
         layout.addWidget(QLabel("Метка узла:"))
         layout.addWidget(self.label_edit)
 
@@ -155,6 +159,8 @@ class NodeDialog(QDialog):
         self.setLayout(layout)
 
     def _save(self):
+        # Принудительно обновляем значения всех полей перед закрытием диалога
+        self.editor.get_properties()
         self.node_data = {
             "label": self.label_edit.text(),
             "properties": self.editor.get_properties()
@@ -270,7 +276,8 @@ class Bridge(QObject):
             nodes, _ = main.client.get_graph()
             node = next((n for n in nodes if n["uuid"] == element_id), None)
             if node:
-                dlg = NodeDialog(node_uuid=element_id, node_label=node["label"], node_props=node["properties"], parent=main)
+                dlg = NodeDialog(node_id=element_id, node_label=node["label"], node_props=node["properties"],
+                                 parent=main)
                 if dlg.exec_() == QDialog.Accepted:
                     data = dlg.node_data
                     main.client.update_node_properties(element_id, data["properties"])
