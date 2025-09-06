@@ -34,3 +34,4 @@ results/
 # Операционные системы
 .DS_Store
 Thumbs.db
+/lib/
