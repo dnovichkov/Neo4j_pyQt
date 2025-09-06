@@ -35,3 +35,4 @@ results/
 .DS_Store
 Thumbs.db
 /lib/
+/graph.html
