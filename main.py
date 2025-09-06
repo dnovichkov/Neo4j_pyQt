@@ -1,5 +1,6 @@
 import sys
 import os
+import uuid
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QComboBox, QLabel, QVBoxLayout,
     QWidget, QAction, QFileDialog, QMessageBox, QDialog, QFormLayout,
@@ -10,7 +11,6 @@ from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtCore import QUrl, pyqtSlot, QObject
 from pyvis.network import Network
 from neo4j import GraphDatabase
-
 
 # ---------------------------
 # Neo4j клиент
@@ -27,11 +27,14 @@ class Neo4jClient:
             nodes_result = session.run("MATCH (n) RETURN n")
             nodes = []
             for record in nodes_result:
-                node = record["n"]
+                n = record["n"]
+                n_uuid = n.get("uuid", str(n.id))
+                n_label = n.get("label", n_uuid)
+                n_props = dict(n.items())
                 nodes.append({
-                    "id": node.element_id,
-                    "label": node.get("label", node.element_id),
-                    "properties": dict(node.items())
+                    "uuid": n_uuid,
+                    "label": n_label,
+                    "properties": n_props
                 })
 
             rels_result = session.run("MATCH (a)-[r]->(b) RETURN r, a, b")
@@ -40,51 +43,63 @@ class Neo4jClient:
                 r = record["r"]
                 a = record["a"]
                 b = record["b"]
+                a_uuid = a.get("uuid", str(a.id))
+                b_uuid = b.get("uuid", str(b.id))
                 rels.append({
-                    "from": a.element_id,
-                    "to": b.element_id,
+                    "from": a_uuid,
+                    "to": b_uuid,
                     "type": r.type,
                     "properties": dict(r.items()),
                     "direction": "->"
                 })
+            print(f"DEBUG: Loaded {len(nodes)} nodes and {len(rels)} relationships from Neo4j")
         return nodes, rels
 
     def add_node(self, label, properties):
+        properties = properties.copy()
+        properties["uuid"] = str(uuid.uuid4())
+        if label:
+            properties["label"] = label
+        props_str = ", ".join([f"{k}: ${k}" for k in properties])
+        query = f"CREATE (n {{{props_str}}}) RETURN n"
         with self.driver.session() as session:
-            props_str = ", ".join([f"{k}: ${k}" for k in properties])
-            query = f"CREATE (n:{label} {{{props_str}}}) RETURN n"
-            session.run(query, **properties)
+            print("DEBUG: Creating node:", properties)
+            result = session.run(query, **properties)
+            created = list(result)
+            print("DEBUG: Node created:", created)
+            return created
 
-    def add_relationship(self, from_id, to_id, r_type, direction, properties):
+    def add_relationship(self, from_uuid, to_uuid, r_type, direction, properties):
         with self.driver.session() as session:
             query = (
-                "MATCH (a),(b) "
-                "WHERE elementId(a) = $from_id AND elementId(b) = $to_id "
+                "MATCH (a {uuid: $from_uuid}), (b {uuid: $to_uuid}) "
                 f"CREATE (a)-[r:{r_type} $props]->(b) RETURN r"
             )
             print("DEBUG: Creating relationship")
-            print("from_id:", from_id)
-            print("to_id:", to_id)
+            print("from_uuid:", from_uuid)
+            print("to_uuid:", to_uuid)
             print("r_type:", r_type)
             print("properties:", properties)
-            result = session.run(query, from_id=from_id, to_id=to_id, props=properties)
+            result = session.run(query, from_uuid=from_uuid, to_uuid=to_uuid, props=properties)
             created = list(result)
             print("DEBUG: Relationship created:", created)
             return created
 
-    def update_node_properties(self, node_id, properties):
+    def update_node_properties(self, node_uuid, properties):
         with self.driver.session() as session:
-            query = "MATCH (n) WHERE elementId(n)=$nid SET n += $props RETURN n"
-            session.run(query, nid=node_id, props=properties)
+            query = "MATCH (n {uuid:$uuid}) SET n += $props RETURN n"
+            print(f"DEBUG: Updating node {node_uuid} with {properties}")
+            session.run(query, uuid=node_uuid, props=properties)
 
-    def update_relationship_properties(self, from_id, to_id, r_type, properties):
+    def update_relationship_properties(self, from_uuid, to_uuid, r_type, properties):
         with self.driver.session() as session:
             query = (
                 f"MATCH (a)-[r:{r_type}]->(b) "
-                "WHERE elementId(a)=$from_id AND elementId(b)=$to_id "
+                "WHERE a.uuid=$from_uuid AND b.uuid=$to_uuid "
                 "SET r += $props RETURN r"
             )
-            session.run(query, from_id=from_id, to_id=to_id, props=properties)
+            print(f"DEBUG: Updating relationship {r_type} {from_uuid}->{to_uuid} with {properties}")
+            session.run(query, from_uuid=from_uuid, to_uuid=to_uuid, props=properties)
 
 
 # ---------------------------
@@ -121,16 +136,16 @@ class PropertyEditor(QWidget):
 # Диалоги узлов и связей
 # ---------------------------
 class NodeDialog(QDialog):
-    def __init__(self, node_id, node_label=None, node_props=None, parent=None):
+    def __init__(self, node_uuid, node_label=None, node_props=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Узел {node_id}")
+        self.setWindowTitle(f"Узел {node_uuid}")
         layout = QVBoxLayout(self)
 
-        props = node_props or {"тип": "Person"}
+        props = node_props or {}
         self.editor = PropertyEditor(props)
         layout.addWidget(self.editor)
 
-        self.label_edit = QLineEdit(node_label or f"Node {node_id}")
+        self.label_edit = QLineEdit(node_label or "")
         layout.addWidget(QLabel("Метка узла:"))
         layout.addWidget(self.label_edit)
 
@@ -140,7 +155,10 @@ class NodeDialog(QDialog):
         self.setLayout(layout)
 
     def _save(self):
-        self.node_data = {"label": self.label_edit.text(), "properties": self.editor.get_properties()}
+        self.node_data = {
+            "label": self.label_edit.text(),
+            "properties": self.editor.get_properties()
+        }
         self.accept()
 
 
@@ -197,8 +215,8 @@ class NewRelationshipDialog(QDialog):
         self.from_box = QComboBox()
         self.to_box = QComboBox()
         for n in nodes:
-            self.from_box.addItem(n["label"], n["id"])
-            self.to_box.addItem(n["label"], n["id"])
+            self.from_box.addItem(n["label"], n["uuid"])
+            self.to_box.addItem(n["label"], n["uuid"])
 
         layout.addWidget(QLabel("От узла:"))
         layout.addWidget(self.from_box)
@@ -223,15 +241,15 @@ class NewRelationshipDialog(QDialog):
         self.setLayout(layout)
 
     def get_data(self):
-        from_id = self.from_box.currentData()
-        to_id = self.to_box.currentData()
+        from_uuid = self.from_box.currentData()
+        to_uuid = self.to_box.currentData()
         r_type = self.type_edit.text().strip()
         direction = self.direction_box.currentText()
         props = self.editor.get_properties()
-        print(f"DEBUG: get_data() -> from_id={from_id}, to_id={to_id}, type={r_type}, props={props}")
+        print(f"DEBUG: get_data() -> from={from_uuid}, to={to_uuid}, type={r_type}, props={props}")
         return {
-            "from": from_id,
-            "to": to_id,
+            "from": from_uuid,
+            "to": to_uuid,
             "type": r_type,
             "direction": direction,
             "properties": props
@@ -239,7 +257,7 @@ class NewRelationshipDialog(QDialog):
 
 
 # ---------------------------
-# Мост JS ↔ Python
+# Bridge JS ↔ Python
 # ---------------------------
 class Bridge(QObject):
     def __init__(self, parent=None):
@@ -250,12 +268,14 @@ class Bridge(QObject):
         main = self.parent()
         if element_type == "node":
             nodes, _ = main.client.get_graph()
-            node = next((n for n in nodes if n["id"] == element_id), None)
+            node = next((n for n in nodes if n["uuid"] == element_id), None)
             if node:
-                dlg = NodeDialog(node_id=element_id, node_label=node["label"], node_props=node["properties"], parent=main)
+                dlg = NodeDialog(node_uuid=element_id, node_label=node["label"], node_props=node["properties"], parent=main)
                 if dlg.exec_() == QDialog.Accepted:
                     data = dlg.node_data
                     main.client.update_node_properties(element_id, data["properties"])
+                    if data["label"]:
+                        main.client.update_node_properties(element_id, {"label": data["label"]})
                     main._load_graph(main.filter_box.currentText())
         else:
             _, rels = main.client.get_graph()
@@ -275,9 +295,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Neo4j PyQt App")
-
-        # сначала создаём клиент
-        self.client = Neo4jClient(password="testtest")
+        self.client = Neo4jClient(password="testtest")  # пароль для БД
 
         self.view = QWebEngineView()
         layout = QVBoxLayout()
@@ -313,7 +331,6 @@ class MainWindow(QMainWindow):
         export_action.triggered.connect(self._export_graph)
         file_menu.addAction(export_action)
 
-        # загрузка графа
         self._load_graph()
 
     def _reload_graph(self, selected_type):
@@ -323,18 +340,12 @@ class MainWindow(QMainWindow):
         nodes, rels = self.client.get_graph()
         if selected_type != "Все":
             nodes = [n for n in nodes if n["properties"].get("тип") == selected_type]
-            node_ids = {n["id"] for n in nodes}
+            node_ids = {n["uuid"] for n in nodes}
             rels = [r for r in rels if r["from"] in node_ids and r["to"] in node_ids]
-
-        print(f"DEBUG: Loaded {len(nodes)} nodes and {len(rels)} edges from Neo4j")
 
         net = Network(height="750px", width="100%", directed=True)
         for n in nodes:
-            net.add_node(
-                n["id"],
-                label=n.get("label", str(n["id"])),
-                title=str(n.get("properties", {}))
-            )
+            net.add_node(n["uuid"], label=n.get("label", n["uuid"]), title=str(n.get("properties", {})))
         for r in rels:
             arrows = "to" if r.get("direction", "->") == "->" else "from" if r.get("direction") == "<-" else "to,from"
             net.add_edge(r["from"], r["to"], label=r["type"], title=str(r.get("properties", {})), arrows=arrows)
@@ -389,7 +400,7 @@ class MainWindow(QMainWindow):
                 nodes, rels = self.client.get_graph()
                 net = Network(height="750px", width="100%", directed=True)
                 for n in nodes:
-                    net.add_node(n["id"], label=n.get("label", str(n["id"])), title=str(n.get("properties", {})))
+                    net.add_node(n["uuid"], label=n.get("label", n["uuid"]), title=str(n.get("properties", {})))
                 for r in rels:
                     net.add_edge(r["from"], r["to"], label=r["type"], title=str(r.get("properties", {})))
                 net.write_html(path, notebook=False)
