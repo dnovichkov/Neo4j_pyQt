@@ -1,0 +1,4 @@
+pyqt5
+PyQtWebEngine
+neo4j
+pyvis
