@@ -38,12 +38,13 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
 
 def get_node_types_query():
     return "MATCH (n) WHERE n.`тип` IS NOT NULL RETURN DISTINCT n.`тип` as t"
+
 # ---------------------------
 # Worker для выполнения задач в пуле потоков
 # ---------------------------
 class WorkerSignals(QObject):
-    result = pyqtSignal(object)   # {'task': name, 'result': ...}
-    error = pyqtSignal(object)    # {'task': name, 'error': exception}
+    result = pyqtSignal(object)
+    error = pyqtSignal(object)
     finished = pyqtSignal()
 
 
@@ -223,6 +224,7 @@ class NodeDialog(QDialog):
     def __init__(self, node_id, node_label=None, node_props=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Узел {node_id}")
+        self.setModal(True)
         self.node_id = node_id
         layout = QVBoxLayout(self)
 
@@ -251,6 +253,7 @@ class RelationshipDialog(QDialog):
     def __init__(self, rel_type, rel_props=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Редактировать связь {rel_type}")
+        self.setModal(True)
         layout = QVBoxLayout(self)
 
         self.editor = PropertyEditor(rel_props or {})
@@ -266,13 +269,11 @@ class RelationshipDialog(QDialog):
         self.accept()
 
 
-# ---------------------------
-# Диалоги создания нового узла/отношения с preview
-# ---------------------------
 class NewNodeDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Создать новый узел")
+        self.setModal(True)
         layout = QVBoxLayout(self)
 
         self.label_edit = QLineEdit()
@@ -329,6 +330,7 @@ class NewRelationshipDialog(QDialog):
     def __init__(self, nodes, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Создать новое отношение")
+        self.setModal(True)
         layout = QVBoxLayout(self)
 
         self.from_box = QComboBox()
@@ -375,7 +377,6 @@ class NewRelationshipDialog(QDialog):
             "direction": direction,
             "properties": props
         }
-
 
 # ---------------------------
 # Мост JS ↔ Python
