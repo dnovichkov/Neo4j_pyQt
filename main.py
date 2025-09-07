@@ -1,9 +1,11 @@
 import sys
 import os
+import json
 import tempfile
 import uuid
 import logging
 from functools import partial
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QComboBox, QLabel, QVBoxLayout,
     QWidget, QAction, QFileDialog, QMessageBox, QDialog, QFormLayout,
@@ -11,40 +13,83 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtWebChannel import QWebChannel
-from PyQt5.QtCore import QUrl, pyqtSlot, QObject, QRunnable, QThreadPool, pyqtSignal
+from PyQt5.QtCore import (
+    QUrl, pyqtSlot, QObject, QRunnable, QThreadPool, pyqtSignal, Qt
+)
 from pyvis.network import Network
 from neo4j import GraphDatabase
 
+
+# ---------------------------
+# Логирование
+# ---------------------------
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------
+# Конфиг
+# ---------------------------
+CONFIG_FILE = "config.json"
+
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        default_cfg = {
+            "uri": "bolt://localhost:7687",
+            "user": "neo4j",
+            "password": "testtest"
+        }
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_cfg, f, indent=4, ensure_ascii=False)
+        return default_cfg
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+
+
+def get_node_types_query():
+    # исправлено: exists(...) → IS NOT NULL
+    return "MATCH (n) WHERE n.`тип` IS NOT NULL RETURN DISTINCT n.`тип` AS t"
+
+
 def _js_bridge_script():
+    # Возвращает готовый блок JS + закрывающий </body>.
+    # Встраивается через html.replace("</body>", _js_bridge_script())
     return """
 <script type="text/javascript" src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <script>
-new QWebChannel(qt.webChannelTransport, function(channel) {
+if (typeof QWebChannel === "function") {
+  new QWebChannel(qt.webChannelTransport, function(channel) {
     window.bridge = channel.objects.bridge;
-    network.on("click", function(params) {
-        if(params.nodes && params.nodes.length > 0){
+    if (typeof network !== "undefined" && network) {
+      network.on("click", function(params) {
+        try {
+          if (params && params.nodes && params.nodes.length > 0) {
             bridge.onNodeClicked("node", params.nodes[0].toString());
-        } else if(params.edges && params.edges.length > 0){
+          } else if (params && params.edges && params.edges.length > 0) {
             bridge.onNodeClicked("edge", params.edges[0].toString());
-        }
-    });
-});
+          }
+        } catch (e) { console.error("Bridge error:", e); }
+      });
+    }
+  });
+}
 </script>
-</body>"""
+</body>
+"""
 
-def get_node_types_query():
-    return "MATCH (n) WHERE n.`тип` IS NOT NULL RETURN DISTINCT n.`тип` as t"
 
 # ---------------------------
-# Worker для выполнения задач в пуле потоков
+# Worker для выполнения задач
 # ---------------------------
 class WorkerSignals(QObject):
-    result = pyqtSignal(object)
-    error = pyqtSignal(object)
+    result = pyqtSignal(object)   # {'task': name, 'result': ...}
+    error = pyqtSignal(object)    # {'task': name, 'error': exception}
     finished = pyqtSignal()
 
 
@@ -76,7 +121,10 @@ class Neo4jClient:
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
 
     def close(self):
-        self.driver.close()
+        try:
+            self.driver.close()
+        except Exception:
+            pass
 
     def get_graph(self):
         with self.driver.session() as session:
@@ -86,8 +134,8 @@ class Neo4jClient:
                 n = record["n"]
                 props = dict(n.items())
                 node_uuid = props.get("uuid") or str(n.id)
-                labels = list(n.labels) if hasattr(n, 'labels') else []
-                label = labels[0] if labels else node_uuid
+                labels = list(getattr(n, "labels", []))
+                label = labels[0] if labels else props.get("label") or node_uuid
                 nodes.append({
                     "id": node_uuid,
                     "label": label,
@@ -100,8 +148,8 @@ class Neo4jClient:
                 r = record["r"]
                 a = record["a"]
                 b = record["b"]
-                props = dict(r.items())
-                rel_uuid = props.get("uuid") or str(r.id)
+                r_props = dict(r.items())
+                rel_uuid = r_props.get("uuid") or str(r.id)
                 from_uuid = dict(a.items()).get("uuid") or str(a.id)
                 to_uuid = dict(b.items()).get("uuid") or str(b.id)
                 rels.append({
@@ -109,75 +157,73 @@ class Neo4jClient:
                     "from": from_uuid,
                     "to": to_uuid,
                     "type": r.type,
-                    "properties": props,
+                    "properties": r_props,
                     "direction": "->"
                 })
-        logger.debug(f"Loaded {len(nodes)} nodes and {len(rels)} relationships from Neo4j")
+        logger.debug("Loaded %d nodes and %d relationships", len(nodes), len(rels))
         return nodes, rels
 
     def add_node(self, label, properties):
         with self.driver.session() as session:
             node_uuid = str(uuid.uuid4())
-            props = properties.copy() if properties else {}
+            props = dict(properties or {})
             props["uuid"] = node_uuid
             safe_label = "".join(ch for ch in (label or "Node") if ch.isalnum() or ch == "_") or "Node"
             query = f"CREATE (n:{safe_label}) SET n += $props RETURN n"
-            logger.debug("Creating node with label=%s props=%s", safe_label, props)
+            logger.debug("Creating node: label=%s props=%s", safe_label, props)
             result = session.run(query, props=props)
-            created = list(result)
-            logger.debug("Node created: %s", created)
-            return created
+            return list(result)
 
     def add_relationship(self, from_uuid, to_uuid, r_type, direction, properties):
         with self.driver.session() as session:
             rel_uuid = str(uuid.uuid4())
-            props = properties.copy() if properties else {}
+            props = dict(properties or {})
             props["uuid"] = rel_uuid
             safe_type = "".join(ch for ch in (r_type or "REL") if ch.isalnum() or ch == "_") or "REL"
+            # направление в pyvis отображаем стрелками; в БД создаём (a)-[r]->(b)
+            if direction == "<-":
+                from_uuid, to_uuid = to_uuid, from_uuid
             query = (
                 f"MATCH (a {{uuid:$from_uuid}}), (b {{uuid:$to_uuid}}) "
                 f"CREATE (a)-[r:{safe_type}]->(b) SET r += $props RETURN r"
             )
-            logger.debug("Creating relationship from=%s to=%s type=%s props=%s", from_uuid, to_uuid, safe_type, props)
+            logger.debug("Creating relationship %s: %s -> %s, props=%s", safe_type, from_uuid, to_uuid, props)
             result = session.run(query, from_uuid=from_uuid, to_uuid=to_uuid, props=props)
-            created = list(result)
-            logger.debug("Relationship created: %s", created)
-            return created
+            return list(result)
 
     def update_node_properties(self, node_uuid, properties):
         with self.driver.session() as session:
             query = "MATCH (n) WHERE n.uuid=$nid SET n += $props RETURN n"
-            logger.debug("Updating node %s with props=%s", node_uuid, properties)
+            logger.debug("Updating node %s props=%s", node_uuid, properties)
             session.run(query, nid=node_uuid, props=properties)
 
     def update_relationship_properties(self, rel_uuid, properties):
         with self.driver.session() as session:
             query = "MATCH ()-[r]->() WHERE r.uuid=$rid SET r += $props RETURN r"
-            logger.debug("Updating relationship %s with props=%s", rel_uuid, properties)
+            logger.debug("Updating relationship %s props=%s", rel_uuid, properties)
             session.run(query, rid=rel_uuid, props=properties)
 
 
 # ---------------------------
-# PropertyEditor
+# PropertyEditor (с кнопкой удаления строк)
 # ---------------------------
 class PropertyEditor(QWidget):
     def __init__(self, properties=None):
         super().__init__()
-        self.layout = QVBoxLayout()
+        self.layout = QVBoxLayout(self)
         self.form_layout = QFormLayout()
         self.layout.addLayout(self.form_layout)
-        self.setLayout(self.layout)
-        self.fields = []  # list of tuples (key_edit, val_edit, row_widget)
+        self.fields = []  # (key_edit, val_edit, row_widget)
 
         if properties:
             for k, v in properties.items():
                 self.add_field(k, v)
 
         add_btn = QPushButton("Добавить поле")
-        add_btn.clicked.connect(lambda: self._add_and_refresh())
+        add_btn.clicked.connect(self._add_field_clicked)
         self.layout.addWidget(add_btn)
 
-    def _add_and_refresh(self):
+    def _add_field_clicked(self):
         self.add_field()
 
     def add_field(self, key="", value=""):
@@ -193,10 +239,7 @@ class PropertyEditor(QWidget):
         self.form_layout.addRow(row_widget)
         self.fields.append((key_edit, val_edit, row_widget))
 
-        def _remove():
-            self._remove_field(row_widget)
-
-        remove_btn.clicked.connect(_remove)
+        remove_btn.clicked.connect(lambda: self._remove_field(row_widget))
 
     def _remove_field(self, row_widget):
         for i, (k_edit, v_edit, rw) in enumerate(self.fields):
@@ -212,34 +255,39 @@ class PropertyEditor(QWidget):
             k = k_edit.text().strip()
             if not k:
                 continue
-            v = v_edit.text()
-            out[k] = v
+            out[k] = v_edit.text()
         return out
 
 
 # ---------------------------
-# Диалоги узлов и связей
+# Диалоги
 # ---------------------------
 class NodeDialog(QDialog):
+    """Редактирование существующего узла"""
     def __init__(self, node_id, node_label=None, node_props=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Узел {node_id}")
         self.setModal(True)
-        self.node_id = node_id
+        self.setWindowModality(Qt.ApplicationModal)
+
         layout = QVBoxLayout(self)
 
-        props = node_props or {}
-        self.editor = PropertyEditor(props)
+        self.editor = PropertyEditor(node_props or {})
         layout.addWidget(self.editor)
 
-        self.label_edit = QLineEdit(node_label or "")
         layout.addWidget(QLabel("Метка узла:"))
+        self.label_edit = QLineEdit(node_label or "")
         layout.addWidget(self.label_edit)
 
+        btns = QHBoxLayout()
         btn_save = QPushButton("Сохранить")
+        btn_cancel = QPushButton("Отмена")
+        btns.addWidget(btn_save)
+        btns.addWidget(btn_cancel)
+        layout.addLayout(btns)
+
         btn_save.clicked.connect(self._on_save_clicked)
-        layout.addWidget(btn_save)
-        self.setLayout(layout)
+        btn_cancel.clicked.connect(self.reject)
 
     def _on_save_clicked(self):
         self.node_data = {
@@ -250,19 +298,27 @@ class NodeDialog(QDialog):
 
 
 class RelationshipDialog(QDialog):
+    """Редактирование существующего отношения"""
     def __init__(self, rel_type, rel_props=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Редактировать связь {rel_type}")
         self.setModal(True)
+        self.setWindowModality(Qt.ApplicationModal)
+
         layout = QVBoxLayout(self)
 
         self.editor = PropertyEditor(rel_props or {})
         layout.addWidget(self.editor)
 
+        btns = QHBoxLayout()
         btn_save = QPushButton("Сохранить")
+        btn_cancel = QPushButton("Отмена")
+        btns.addWidget(btn_save)
+        btns.addWidget(btn_cancel)
+        layout.addLayout(btns)
+
         btn_save.clicked.connect(self._on_save_clicked)
-        layout.addWidget(btn_save)
-        self.setLayout(layout)
+        btn_cancel.clicked.connect(self.reject)
 
     def _on_save_clicked(self):
         self.rel_data = {"properties": self.editor.get_properties()}
@@ -270,15 +326,17 @@ class RelationshipDialog(QDialog):
 
 
 class NewNodeDialog(QDialog):
+    """Создание нового узла (с предпросмотром PyVis)"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Создать новый узел")
         self.setModal(True)
+        self.setWindowModality(Qt.ApplicationModal)
+
         layout = QVBoxLayout(self)
 
-        self.label_edit = QLineEdit()
-        self.label_edit.textChanged.connect(self.update_preview)
         layout.addWidget(QLabel("Метка узла:"))
+        self.label_edit = QLineEdit()
         layout.addWidget(self.label_edit)
 
         self.editor = PropertyEditor()
@@ -288,34 +346,47 @@ class NewNodeDialog(QDialog):
         self.preview_view = QWebEngineView()
         layout.addWidget(self.preview_view)
 
-        btn_save = QPushButton("Создать")
-        btn_save.clicked.connect(self.accept)
-        layout.addWidget(btn_save)
-        self.setLayout(layout)
+        btns = QHBoxLayout()
+        btn_create = QPushButton("Создать")
+        btn_cancel = QPushButton("Отмена")
+        btns.addWidget(btn_create)
+        btns.addWidget(btn_cancel)
+        layout.addLayout(btns)
+
+        btn_create.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
 
         self._last_preview = None
+        self.label_edit.textChanged.connect(self.update_preview)
+        # при желании можно подписаться на изменения полей; здесь обновляем при закрытии диалога
         self.update_preview()
 
     def get_data(self):
-        return {"label": self.label_edit.text().strip(), "properties": self.editor.get_properties()}
+        return {
+            "label": self.label_edit.text().strip(),
+            "properties": self.editor.get_properties()
+        }
 
     def update_preview(self):
-        label = self.label_edit.text() or "Node"
-        props = self.editor.get_properties()
-        net = Network(height="200px", width="100%", directed=True)
-        net.add_node("preview", label=label, title=str(props))
+        try:
+            label = self.label_edit.text().strip() or "Node"
+            props = self.editor.get_properties()
+            net = Network(height="200px", width="100%", directed=True)
+            net.add_node("preview", label=label, title=str(props))
 
-        if self._last_preview and os.path.exists(self._last_preview):
-            try:
-                os.remove(self._last_preview)
-            except OSError:
-                pass
+            if self._last_preview and os.path.exists(self._last_preview):
+                try:
+                    os.remove(self._last_preview)
+                except OSError:
+                    pass
 
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-        tmp_file.close()
-        net.write_html(tmp_file.name, notebook=False)
-        self._last_preview = tmp_file.name
-        self.preview_view.load(QUrl.fromLocalFile(tmp_file.name))
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+            tmp_file.close()
+            net.write_html(tmp_file.name, notebook=False)
+            self._last_preview = tmp_file.name
+            self.preview_view.load(QUrl.fromLocalFile(tmp_file.name))
+        except Exception as e:
+            logger.exception("Preview error: %s", e)
 
     def closeEvent(self, event):
         if self._last_preview and os.path.exists(self._last_preview):
@@ -327,10 +398,13 @@ class NewNodeDialog(QDialog):
 
 
 class NewRelationshipDialog(QDialog):
+    """Создание нового отношения"""
     def __init__(self, nodes, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Создать новое отношение")
         self.setModal(True)
+        self.setWindowModality(Qt.ApplicationModal)
+
         layout = QVBoxLayout(self)
 
         self.from_box = QComboBox()
@@ -346,37 +420,76 @@ class NewRelationshipDialog(QDialog):
         layout.addWidget(QLabel("К узлу:"))
         layout.addWidget(self.to_box)
 
-        self.type_edit = QLineEdit("REL_TYPE")
         layout.addWidget(QLabel("Тип отношения:"))
+        self.type_edit = QLineEdit("REL_TYPE")
         layout.addWidget(self.type_edit)
 
+        layout.addWidget(QLabel("Направление:"))
         self.direction_box = QComboBox()
         self.direction_box.addItems(["->", "<-", "двунаправленное"])
-        layout.addWidget(QLabel("Направление:"))
         layout.addWidget(self.direction_box)
 
         self.editor = PropertyEditor()
         layout.addWidget(self.editor)
 
-        btn_save = QPushButton("Создать")
-        btn_save.clicked.connect(self.accept)
-        layout.addWidget(btn_save)
-        self.setLayout(layout)
+        btns = QHBoxLayout()
+        btn_create = QPushButton("Создать")
+        btn_cancel = QPushButton("Отмена")
+        btns.addWidget(btn_create)
+        btns.addWidget(btn_cancel)
+        layout.addLayout(btns)
+
+        btn_create.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
 
     def get_data(self):
-        from_id = self.from_box.currentData()
-        to_id = self.to_box.currentData()
-        r_type = self.type_edit.text().strip() or "REL"
-        direction = self.direction_box.currentText()
-        props = self.editor.get_properties()
-        logger.debug("NewRelationshipDialog.get_data -> from=%s to=%s type=%s props=%s", from_id, to_id, r_type, props)
         return {
-            "from": from_id,
-            "to": to_id,
-            "type": r_type,
-            "direction": direction,
-            "properties": props
+            "from": self.from_box.currentData(),
+            "to": self.to_box.currentData(),
+            "type": (self.type_edit.text().strip() or "REL"),
+            "direction": self.direction_box.currentText(),
+            "properties": self.editor.get_properties()
         }
+
+
+# ---------------------------
+# Диалог настроек подключения
+# ---------------------------
+class ConnectionDialog(QDialog):
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройки подключения Neo4j")
+        self.setModal(True)
+        self.setWindowModality(Qt.ApplicationModal)
+
+        layout = QFormLayout(self)
+
+        self.uri_edit = QLineEdit(config.get("uri", "bolt://localhost:7687"))
+        self.user_edit = QLineEdit(config.get("user", "neo4j"))
+        self.pass_edit = QLineEdit(config.get("password", ""))
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+
+        layout.addRow("URI:", self.uri_edit)
+        layout.addRow("Пользователь:", self.user_edit)
+        layout.addRow("Пароль:", self.pass_edit)
+
+        btns = QHBoxLayout()
+        btn_save = QPushButton("Сохранить")
+        btn_cancel = QPushButton("Отмена")
+        btns.addWidget(btn_save)
+        btns.addWidget(btn_cancel)
+        layout.addRow(btns)
+
+        btn_save.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+    def get_config(self):
+        return {
+            "uri": self.uri_edit.text().strip(),
+            "user": self.user_edit.text().strip(),
+            "password": self.pass_edit.text().strip()
+        }
+
 
 # ---------------------------
 # Мост JS ↔ Python
@@ -389,23 +502,33 @@ class Bridge(QObject):
     def onNodeClicked(self, element_type, element_id):
         main = self.parent()
         if element_type == "node":
-            # Запрос графа синхронно не нужен - мы уже поддерживаем актуальность
             nodes, _ = main.client.get_graph()
             node = next((n for n in nodes if str(n.get("id")) == str(element_id)), None)
             if node:
-                dlg = NodeDialog(node_id=node["id"], node_label=node["label"], node_props=node["properties"], parent=main)
+                dlg = NodeDialog(
+                    node_id=node["id"],
+                    node_label=node["label"],
+                    node_props=node["properties"],
+                    parent=main
+                )
                 if dlg.exec_() == QDialog.Accepted:
                     data = dlg.node_data
-                    # выполняем обновление в воркере
-                    main.submit_task(lambda: main.client.update_node_properties(node["id"], data["properties"]), 'update_node')
-        else:  # edge
+                    # обновляем только свойства; смену метки в данном примере не записываем как label/Label
+                    main.submit_task(
+                        lambda: main.client.update_node_properties(node["id"], data["properties"]),
+                        'update_node'
+                    )
+        elif element_type == "edge":
             _, rels = main.client.get_graph()
             rel = next((r for r in rels if str(r.get("id")) == str(element_id)), None)
             if rel:
                 dlg = RelationshipDialog(rel_type=rel["type"], rel_props=rel["properties"], parent=main)
                 if dlg.exec_() == QDialog.Accepted:
                     data = dlg.rel_data
-                    main.submit_task(lambda: main.client.update_relationship_properties(rel["id"], data["properties"]), 'update_rel')
+                    main.submit_task(
+                        lambda: main.client.update_relationship_properties(rel["id"], data["properties"]),
+                        'update_rel'
+                    )
 
 
 # ---------------------------
@@ -415,31 +538,33 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Neo4j PyQt App (async)")
-        # Установим разумный размер окна по умолчанию и минимальный размер
+        # адекватный стартовый размер + минимальный
         self.resize(1200, 800)
         self.setMinimumSize(900, 600)
-        # Попробуем центрировать окно на основном экране (без падения при ошибках)
-        try:
-            screen_geom = QApplication.primaryScreen().availableGeometry()
-            x = (screen_geom.width() - self.width()) // 2
-            y = (screen_geom.height() - self.height()) // 2
-            self.move(x, y)
-        except Exception:
-            pass
-        self.client = Neo4jClient(password="testtest")
 
+        # загружаем конфиг и подключаемся
+        self.config = load_config()
+        self.client = Neo4jClient(
+            uri=self.config["uri"],
+            user=self.config["user"],
+            password=self.config["password"]
+        )
+
+        # WebView
         self.view = QWebEngineView()
-        layout = QVBoxLayout()
-        layout.addWidget(self.view)
-        central = QWidget()
-        central.setLayout(layout)
-        self.setCentralWidget(central)
+        central_layout = QVBoxLayout()
+        central_layout.addWidget(self.view)
+        central_widget = QWidget()
+        central_widget.setLayout(central_layout)
+        self.setCentralWidget(central_widget)
 
+        # JS Bridge
         self.channel = QWebChannel()
         self.bridge = Bridge(self)
         self.channel.registerObject("bridge", self.bridge)
         self.view.page().setWebChannel(self.channel)
 
+        # Toolbar
         toolbar = QToolBar("Фильтры")
         self.addToolBar(toolbar)
         toolbar.addWidget(QLabel("Фильтр по типу: "))
@@ -455,27 +580,30 @@ class MainWindow(QMainWindow):
         add_rel_btn.triggered.connect(self._create_relationship)
         toolbar.addAction(add_rel_btn)
 
+        # Меню
         menubar = self.menuBar()
         file_menu = menubar.addMenu("Файл")
+
         export_action = QAction("Экспортировать граф", self)
         export_action.triggered.connect(self._export_graph)
         file_menu.addAction(export_action)
 
-        # пул потоков для выполнения DB-операций
+        settings_action = QAction("Настройки подключения", self)
+        settings_action.triggered.connect(self._open_settings)
+        file_menu.addAction(settings_action)
+
+        # Пул потоков
         self.pool = QThreadPool.globalInstance()
 
+        # Инициализация UI
         self._populate_filters()
-        # загружаем граф асинхронно
         self._load_graph_async()
 
-    # ---------------------------
-    # Вспомогательные методы для отправки задач в пул
-    # ---------------------------
+    # ---------- Helpers: задачи в пул ----------
     def submit_task(self, fn, task_name=None, *args, **kwargs):
         worker = Worker(partial(fn, *args, **kwargs), task_name=task_name)
         worker.signals.result.connect(self._on_task_result)
         worker.signals.error.connect(self._on_task_error)
-        worker.signals.finished.connect(lambda: None)
         self.pool.start(worker)
         return worker
 
@@ -484,16 +612,12 @@ class MainWindow(QMainWindow):
         result = payload.get('result')
         logger.debug("Task finished: %s", task)
         if task == 'get_graph':
-            # result is (nodes, rels)
             nodes, rels = result
             self._apply_graph_to_view(nodes, rels)
         elif task == 'get_types':
-            types = result
-            self._apply_filters(types)
+            self._apply_filters(result)
         else:
-            # Для CRUD операций после выполнения обновим граф
             if task in ('add_node', 'add_rel', 'update_node', 'update_rel'):
-                # Обновим фильтры и перезагрузим граф
                 self._populate_filters_async()
                 self._load_graph_async()
 
@@ -503,13 +627,11 @@ class MainWindow(QMainWindow):
         logger.exception("Error in task %s: %s", task, err)
         QMessageBox.critical(self, f"Ошибка в задаче {task}", str(err))
 
-    # ---------------------------
-    # Фильтры
-    # ---------------------------
+    # ---------- Фильтры ----------
     def _populate_filters(self):
         try:
             with self.client.driver.session() as session:
-                result = session.run("MATCH (n) WHERE n.`тип` IS NOT NULL RETURN DISTINCT n.`тип` as t")
+                result = session.run(get_node_types_query())
                 types = [rec["t"] for rec in result if rec["t"]]
             types = ["Все"] + sorted(set(types))
         except Exception:
@@ -520,25 +642,19 @@ class MainWindow(QMainWindow):
     def _populate_filters_async(self):
         def task():
             with self.client.driver.session() as session:
-                result = session.run("MATCH (n) WHERE n.`тип` IS NOT NULL RETURN DISTINCT n.`тип` as t")
-                return [rec["t"] for rec in result if rec["t"]]
-        self.submit_task(task, 'get_types')
-        def task():
-            with self.client.driver.session() as session:
                 result = session.run(get_node_types_query())
                 return [rec["t"] for rec in result if rec["t"]]
         self.submit_task(task, 'get_types')
 
     def _apply_filters(self, types):
         types = ["Все"] + sorted(set(types))
+        self.filter_box.blockSignals(True)
         self.filter_box.clear()
         self.filter_box.addItems(types)
+        self.filter_box.blockSignals(False)
 
-    # ---------------------------
-    # Загрузка графа (асинхронно)
-    # ---------------------------
+    # ---------- Граф ----------
     def _load_graph_async(self):
-        # отправляем задачу на получение графа
         self.submit_task(self.client.get_graph, 'get_graph')
 
     def _apply_graph_to_view(self, nodes, rels, selected_type=None):
@@ -551,10 +667,24 @@ class MainWindow(QMainWindow):
 
             net = Network(height="750px", width="100%", directed=True)
             for n in nodes:
-                net.add_node(n["id"], label=n.get("label", n["id"]), title=str(n.get("properties", {})))
+                net.add_node(
+                    n["id"],
+                    label=n.get("label", n["id"]),
+                    title=str(n.get("properties", {}))
+                )
             for r in rels:
-                arrows = "to" if r.get("direction", "->") == "->" else "from" if r.get("direction") == "<-" else "to,from"
-                net.add_edge(r["from"], r["to"], label=r["type"], title=str(r.get("properties", {})), arrows=arrows, id=r["id"])
+                arrows = (
+                    "to" if r.get("direction", "->") == "->"
+                    else "from" if r.get("direction") == "<-"
+                    else "to,from"
+                )
+                net.add_edge(
+                    r["from"], r["to"],
+                    label=r["type"],
+                    title=str(r.get("properties", {})),
+                    arrows=arrows,
+                    id=r["id"]  # важно: чтобы клик по ребру возвращал его id
+                )
 
             file_path = os.path.abspath("graph.html")
             net.write_html(file_path, notebook=False)
@@ -562,27 +692,23 @@ class MainWindow(QMainWindow):
             with open(file_path, "r", encoding="utf-8") as f:
                 html = f.read()
 
+            # Вставляем JS-мост
             html = html.replace("</body>", _js_bridge_script())
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(html)
 
-            # загружаем в UI (в main thread)
             self.view.load(QUrl.fromLocalFile(file_path))
         except Exception as e:
             logger.exception("Error applying graph to view: %s", e)
 
-    def _reload_graph(self, selected_type):
-        # при смене фильтра просто повторно запрашиваем граф
+    def _reload_graph(self, _selected_type):
         self._load_graph_async()
 
-    # ---------------------------
-    # Создание/редактирование сущностей
-    # ---------------------------
+    # ---------- Создание/редактирование ----------
     def _create_node(self):
         dlg = NewNodeDialog(self)
         if dlg.exec_() == QDialog.Accepted:
             data = dlg.get_data()
-            # запускаем создание в пуле
             self.submit_task(lambda: self.client.add_node(data["label"], data["properties"]), 'add_node')
 
     def _create_relationship(self):
@@ -590,15 +716,14 @@ class MainWindow(QMainWindow):
         dlg = NewRelationshipDialog(nodes, self)
         if dlg.exec_() == QDialog.Accepted:
             data = dlg.get_data()
-            from_id = data["from"]
-            to_id = data["to"]
-            if data["direction"] == "<-":
-                from_id, to_id = to_id, from_id
-            self.submit_task(lambda: self.client.add_relationship(from_id, to_id, data["type"], data["direction"], data["properties"]), 'add_rel')
+            self.submit_task(
+                lambda: self.client.add_relationship(
+                    data["from"], data["to"], data["type"], data["direction"], data["properties"]
+                ),
+                'add_rel'
+            )
 
-    # ---------------------------
-    # Экспорт
-    # ---------------------------
+    # ---------- Экспорт ----------
     def _export_graph(self):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить граф как HTML", "", "HTML Files (*.html)")
         if path:
@@ -614,6 +739,23 @@ class MainWindow(QMainWindow):
                 logger.exception("Export error: %s", e)
                 QMessageBox.critical(self, "Ошибка экспорта", str(e))
 
+    # ---------- Настройки подключения ----------
+    def _open_settings(self):
+        dlg = ConnectionDialog(self.config, self)
+        if dlg.exec_() == QDialog.Accepted:
+            cfg = dlg.get_config()
+            save_config(cfg)
+            self.config = cfg
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = Neo4jClient(cfg["uri"], cfg["user"], cfg["password"])
+            self._populate_filters()
+            self._load_graph_async()
+            QMessageBox.information(self, "Успех", "Подключение обновлено")
+
+    # ---------- Закрытие ----------
     def closeEvent(self, event):
         try:
             self.client.close()
@@ -628,5 +770,13 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = MainWindow()
+    # на всякий случай центрируем окно
+    try:
+        screen_geom = QApplication.primaryScreen().availableGeometry()
+        x = (screen_geom.width() - w.width()) // 2
+        y = (screen_geom.height() - w.height()) // 2
+        w.move(x, y)
+    except Exception:
+        pass
     w.show()
     sys.exit(app.exec_())
