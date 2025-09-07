@@ -65,6 +65,6 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    # console=False,  # False чтобы окно без консоли
+    console=False,  # False чтобы окно без консоли
     icon=None,
 )
