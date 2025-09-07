@@ -5,3 +5,5 @@ neo4j
 pyinstaller
 pyvis
 pywin32-ctypes
+pytest
+pytest-mock
