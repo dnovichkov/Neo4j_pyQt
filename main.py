@@ -2,6 +2,7 @@ import sys
 import os
 import json
 from functools import partial
+import tempfile
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QComboBox, QLabel, QVBoxLayout,
@@ -282,37 +283,29 @@ class MainWindow(QMainWindow):
 
             net = Network(height="750px", width="100%", directed=True)
             for n in nodes:
-                net.add_node(
-                    n["id"],
-                    label=n.get("label", n["id"]),
-                    title=str(n.get("properties", {}))
-                )
+                net.add_node(n["id"], label=n.get("label", n["id"]), title=str(n.get("properties", {})))
             for r in rels:
-                arrows = (
-                    "to" if r.get("direction", "->") == "->"
-                    else "from" if r.get("direction") == "<-"
-                    else "to,from"
-                )
-                net.add_edge(
-                    r["from"], r["to"],
-                    label=r["type"],
-                    title=str(r.get("properties", {})),
-                    arrows=arrows,
-                    id=r["id"]  # важно: чтобы клик по ребру возвращал его id
-                )
+                arrows = "to" if r.get("direction", "->") == "->" else "from" if r.get(
+                    "direction") == "<-" else "to,from"
+                net.add_edge(r["from"], r["to"], label=r["type"], title=str(r.get("properties", {})), arrows=arrows,
+                             id=r["id"])
 
-            file_path = os.path.abspath("graph.html")
-            net.write_html(file_path, notebook=False)
+            # Создаём временный файл
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+            tmp_file.close()
+            net.write_html(tmp_file.name, notebook=False)
 
-            with open(file_path, "r", encoding="utf-8") as f:
+            # Добавляем JS-мост
+            with open(tmp_file.name, "r", encoding="utf-8") as f:
                 html = f.read()
-
-            # Вставляем JS-мост
             html = html.replace("</body>", _js_bridge_script())
-            with open(file_path, "w", encoding="utf-8") as f:
+            with open(tmp_file.name, "w", encoding="utf-8") as f:
                 f.write(html)
 
-            self.view.load(QUrl.fromLocalFile(file_path))
+            # Загружаем в WebEngineView
+            self.view.load(QUrl.fromLocalFile(tmp_file.name))
+            self._tmp_graph_file = tmp_file.name
+
         except Exception as e:
             logger.exception("Error applying graph to view: %s", e)
 
@@ -376,6 +369,12 @@ class MainWindow(QMainWindow):
             self.client.close()
         except Exception:
             pass
+        # удаляем временный HTML при выходе
+        if hasattr(self, '_tmp_graph_file') and self._tmp_graph_file and os.path.exists(self._tmp_graph_file):
+            try:
+                os.remove(self._tmp_graph_file)
+            except OSError:
+                pass
         super().closeEvent(event)
 
 

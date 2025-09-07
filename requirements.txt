@@ -1,4 +1,7 @@
+altgraph
 pyqt5
 PyQtWebEngine
 neo4j
+pyinstaller
 pyvis
+pywin32-ctypes
