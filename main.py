@@ -1,31 +1,27 @@
 import sys
 import os
 import json
-import tempfile
-import uuid
-import logging
 from functools import partial
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QComboBox, QLabel, QVBoxLayout,
-    QWidget, QAction, QFileDialog, QMessageBox, QDialog, QFormLayout,
-    QLineEdit, QPushButton, QHBoxLayout
+    QWidget, QAction, QFileDialog, QMessageBox, QDialog
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtCore import (
-    QUrl, pyqtSlot, QObject, QRunnable, QThreadPool, pyqtSignal, Qt
+    QUrl, pyqtSlot, QObject, QRunnable, QThreadPool, pyqtSignal
 )
 from pyvis.network import Network
-from neo4j import GraphDatabase
 
+from dialogs import NodeDialog, RelationshipDialog, NewNodeDialog, NewRelationshipDialog, ConnectionDialog
+from neo_4j_client import Neo4jClient
 
 # ---------------------------
 # Логирование
 # ---------------------------
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
 
+from log_utils import logger
 
 # ---------------------------
 # Конфиг
@@ -114,384 +110,6 @@ class Worker(QRunnable):
 
 
 # ---------------------------
-# Neo4j клиент
-# ---------------------------
-class Neo4jClient:
-    def __init__(self, uri="bolt://localhost:7687", user="neo4j", password="testtest"):
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
-
-    def close(self):
-        try:
-            self.driver.close()
-        except Exception:
-            pass
-
-    def get_graph(self):
-        with self.driver.session() as session:
-            nodes_result = session.run("MATCH (n) RETURN n")
-            nodes = []
-            for record in nodes_result:
-                n = record["n"]
-                props = dict(n.items())
-                node_uuid = props.get("uuid") or str(n.id)
-                labels = list(getattr(n, "labels", []))
-                label = labels[0] if labels else props.get("label") or node_uuid
-                nodes.append({
-                    "id": node_uuid,
-                    "label": label,
-                    "properties": props
-                })
-
-            rels_result = session.run("MATCH (a)-[r]->(b) RETURN r, a, b")
-            rels = []
-            for record in rels_result:
-                r = record["r"]
-                a = record["a"]
-                b = record["b"]
-                r_props = dict(r.items())
-                rel_uuid = r_props.get("uuid") or str(r.id)
-                from_uuid = dict(a.items()).get("uuid") or str(a.id)
-                to_uuid = dict(b.items()).get("uuid") or str(b.id)
-                rels.append({
-                    "id": rel_uuid,
-                    "from": from_uuid,
-                    "to": to_uuid,
-                    "type": r.type,
-                    "properties": r_props,
-                    "direction": "->"
-                })
-        logger.debug("Loaded %d nodes and %d relationships", len(nodes), len(rels))
-        return nodes, rels
-
-    def add_node(self, label, properties):
-        with self.driver.session() as session:
-            node_uuid = str(uuid.uuid4())
-            props = dict(properties or {})
-            props["uuid"] = node_uuid
-            safe_label = "".join(ch for ch in (label or "Node") if ch.isalnum() or ch == "_") or "Node"
-            query = f"CREATE (n:{safe_label}) SET n += $props RETURN n"
-            logger.debug("Creating node: label=%s props=%s", safe_label, props)
-            result = session.run(query, props=props)
-            return list(result)
-
-    def add_relationship(self, from_uuid, to_uuid, r_type, direction, properties):
-        with self.driver.session() as session:
-            rel_uuid = str(uuid.uuid4())
-            props = dict(properties or {})
-            props["uuid"] = rel_uuid
-            safe_type = "".join(ch for ch in (r_type or "REL") if ch.isalnum() or ch == "_") or "REL"
-            # направление в pyvis отображаем стрелками; в БД создаём (a)-[r]->(b)
-            if direction == "<-":
-                from_uuid, to_uuid = to_uuid, from_uuid
-            query = (
-                f"MATCH (a {{uuid:$from_uuid}}), (b {{uuid:$to_uuid}}) "
-                f"CREATE (a)-[r:{safe_type}]->(b) SET r += $props RETURN r"
-            )
-            logger.debug("Creating relationship %s: %s -> %s, props=%s", safe_type, from_uuid, to_uuid, props)
-            result = session.run(query, from_uuid=from_uuid, to_uuid=to_uuid, props=props)
-            return list(result)
-
-    def update_node_properties(self, node_uuid, properties):
-        with self.driver.session() as session:
-            query = "MATCH (n) WHERE n.uuid=$nid SET n += $props RETURN n"
-            logger.debug("Updating node %s props=%s", node_uuid, properties)
-            session.run(query, nid=node_uuid, props=properties)
-
-    def update_relationship_properties(self, rel_uuid, properties):
-        with self.driver.session() as session:
-            query = "MATCH ()-[r]->() WHERE r.uuid=$rid SET r += $props RETURN r"
-            logger.debug("Updating relationship %s props=%s", rel_uuid, properties)
-            session.run(query, rid=rel_uuid, props=properties)
-
-
-# ---------------------------
-# PropertyEditor (с кнопкой удаления строк)
-# ---------------------------
-class PropertyEditor(QWidget):
-    def __init__(self, properties=None):
-        super().__init__()
-        self.layout = QVBoxLayout(self)
-        self.form_layout = QFormLayout()
-        self.layout.addLayout(self.form_layout)
-        self.fields = []  # (key_edit, val_edit, row_widget)
-
-        if properties:
-            for k, v in properties.items():
-                self.add_field(k, v)
-
-        add_btn = QPushButton("Добавить поле")
-        add_btn.clicked.connect(self._add_field_clicked)
-        self.layout.addWidget(add_btn)
-
-    def _add_field_clicked(self):
-        self.add_field()
-
-    def add_field(self, key="", value=""):
-        key_edit = QLineEdit(str(key))
-        val_edit = QLineEdit(str(value))
-        remove_btn = QPushButton("✕")
-        row_widget = QWidget()
-        row_layout = QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.addWidget(key_edit)
-        row_layout.addWidget(val_edit)
-        row_layout.addWidget(remove_btn)
-        self.form_layout.addRow(row_widget)
-        self.fields.append((key_edit, val_edit, row_widget))
-
-        remove_btn.clicked.connect(lambda: self._remove_field(row_widget))
-
-    def _remove_field(self, row_widget):
-        for i, (k_edit, v_edit, rw) in enumerate(self.fields):
-            if rw is row_widget:
-                self.form_layout.removeRow(self.form_layout.indexOf(rw))
-                rw.setParent(None)
-                self.fields.pop(i)
-                return
-
-    def get_properties(self):
-        out = {}
-        for k_edit, v_edit, _ in self.fields:
-            k = k_edit.text().strip()
-            if not k:
-                continue
-            out[k] = v_edit.text()
-        return out
-
-
-# ---------------------------
-# Диалоги
-# ---------------------------
-class NodeDialog(QDialog):
-    """Редактирование существующего узла"""
-    def __init__(self, node_id, node_label=None, node_props=None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Узел {node_id}")
-        self.setModal(True)
-        self.setWindowModality(Qt.ApplicationModal)
-
-        layout = QVBoxLayout(self)
-
-        self.editor = PropertyEditor(node_props or {})
-        layout.addWidget(self.editor)
-
-        layout.addWidget(QLabel("Метка узла:"))
-        self.label_edit = QLineEdit(node_label or "")
-        layout.addWidget(self.label_edit)
-
-        btns = QHBoxLayout()
-        btn_save = QPushButton("Сохранить")
-        btn_cancel = QPushButton("Отмена")
-        btns.addWidget(btn_save)
-        btns.addWidget(btn_cancel)
-        layout.addLayout(btns)
-
-        btn_save.clicked.connect(self._on_save_clicked)
-        btn_cancel.clicked.connect(self.reject)
-
-    def _on_save_clicked(self):
-        self.node_data = {
-            "label": self.label_edit.text().strip(),
-            "properties": self.editor.get_properties()
-        }
-        self.accept()
-
-
-class RelationshipDialog(QDialog):
-    """Редактирование существующего отношения"""
-    def __init__(self, rel_type, rel_props=None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Редактировать связь {rel_type}")
-        self.setModal(True)
-        self.setWindowModality(Qt.ApplicationModal)
-
-        layout = QVBoxLayout(self)
-
-        self.editor = PropertyEditor(rel_props or {})
-        layout.addWidget(self.editor)
-
-        btns = QHBoxLayout()
-        btn_save = QPushButton("Сохранить")
-        btn_cancel = QPushButton("Отмена")
-        btns.addWidget(btn_save)
-        btns.addWidget(btn_cancel)
-        layout.addLayout(btns)
-
-        btn_save.clicked.connect(self._on_save_clicked)
-        btn_cancel.clicked.connect(self.reject)
-
-    def _on_save_clicked(self):
-        self.rel_data = {"properties": self.editor.get_properties()}
-        self.accept()
-
-
-class NewNodeDialog(QDialog):
-    """Создание нового узла (с предпросмотром PyVis)"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Создать новый узел")
-        self.setModal(True)
-        self.setWindowModality(Qt.ApplicationModal)
-
-        layout = QVBoxLayout(self)
-
-        layout.addWidget(QLabel("Метка узла:"))
-        self.label_edit = QLineEdit()
-        layout.addWidget(self.label_edit)
-
-        self.editor = PropertyEditor()
-        layout.addWidget(self.editor)
-
-        layout.addWidget(QLabel("Предпросмотр узла:"))
-        self.preview_view = QWebEngineView()
-        layout.addWidget(self.preview_view)
-
-        btns = QHBoxLayout()
-        btn_create = QPushButton("Создать")
-        btn_cancel = QPushButton("Отмена")
-        btns.addWidget(btn_create)
-        btns.addWidget(btn_cancel)
-        layout.addLayout(btns)
-
-        btn_create.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
-
-        self._last_preview = None
-        self.label_edit.textChanged.connect(self.update_preview)
-        # при желании можно подписаться на изменения полей; здесь обновляем при закрытии диалога
-        self.update_preview()
-
-    def get_data(self):
-        return {
-            "label": self.label_edit.text().strip(),
-            "properties": self.editor.get_properties()
-        }
-
-    def update_preview(self):
-        try:
-            label = self.label_edit.text().strip() or "Node"
-            props = self.editor.get_properties()
-            net = Network(height="200px", width="100%", directed=True)
-            net.add_node("preview", label=label, title=str(props))
-
-            if self._last_preview and os.path.exists(self._last_preview):
-                try:
-                    os.remove(self._last_preview)
-                except OSError:
-                    pass
-
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-            tmp_file.close()
-            net.write_html(tmp_file.name, notebook=False)
-            self._last_preview = tmp_file.name
-            self.preview_view.load(QUrl.fromLocalFile(tmp_file.name))
-        except Exception as e:
-            logger.exception("Preview error: %s", e)
-
-    def closeEvent(self, event):
-        if self._last_preview and os.path.exists(self._last_preview):
-            try:
-                os.remove(self._last_preview)
-            except OSError:
-                pass
-        super().closeEvent(event)
-
-
-class NewRelationshipDialog(QDialog):
-    """Создание нового отношения"""
-    def __init__(self, nodes, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Создать новое отношение")
-        self.setModal(True)
-        self.setWindowModality(Qt.ApplicationModal)
-
-        layout = QVBoxLayout(self)
-
-        self.from_box = QComboBox()
-        self.to_box = QComboBox()
-        for n in nodes:
-            label = n.get("label") or n.get("id")
-            uuid_val = n.get("properties", {}).get("uuid") or n.get("id")
-            self.from_box.addItem(label, uuid_val)
-            self.to_box.addItem(label, uuid_val)
-
-        layout.addWidget(QLabel("От узла:"))
-        layout.addWidget(self.from_box)
-        layout.addWidget(QLabel("К узлу:"))
-        layout.addWidget(self.to_box)
-
-        layout.addWidget(QLabel("Тип отношения:"))
-        self.type_edit = QLineEdit("REL_TYPE")
-        layout.addWidget(self.type_edit)
-
-        layout.addWidget(QLabel("Направление:"))
-        self.direction_box = QComboBox()
-        self.direction_box.addItems(["->", "<-", "двунаправленное"])
-        layout.addWidget(self.direction_box)
-
-        self.editor = PropertyEditor()
-        layout.addWidget(self.editor)
-
-        btns = QHBoxLayout()
-        btn_create = QPushButton("Создать")
-        btn_cancel = QPushButton("Отмена")
-        btns.addWidget(btn_create)
-        btns.addWidget(btn_cancel)
-        layout.addLayout(btns)
-
-        btn_create.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
-
-    def get_data(self):
-        return {
-            "from": self.from_box.currentData(),
-            "to": self.to_box.currentData(),
-            "type": (self.type_edit.text().strip() or "REL"),
-            "direction": self.direction_box.currentText(),
-            "properties": self.editor.get_properties()
-        }
-
-
-# ---------------------------
-# Диалог настроек подключения
-# ---------------------------
-class ConnectionDialog(QDialog):
-    def __init__(self, config, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Настройки подключения Neo4j")
-        self.setModal(True)
-        self.setWindowModality(Qt.ApplicationModal)
-
-        layout = QFormLayout(self)
-
-        self.uri_edit = QLineEdit(config.get("uri", "bolt://localhost:7687"))
-        self.user_edit = QLineEdit(config.get("user", "neo4j"))
-        self.pass_edit = QLineEdit(config.get("password", ""))
-        self.pass_edit.setEchoMode(QLineEdit.Password)
-
-        layout.addRow("URI:", self.uri_edit)
-        layout.addRow("Пользователь:", self.user_edit)
-        layout.addRow("Пароль:", self.pass_edit)
-
-        btns = QHBoxLayout()
-        btn_save = QPushButton("Сохранить")
-        btn_cancel = QPushButton("Отмена")
-        btns.addWidget(btn_save)
-        btns.addWidget(btn_cancel)
-        layout.addRow(btns)
-
-        btn_save.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
-
-    def get_config(self):
-        return {
-            "uri": self.uri_edit.text().strip(),
-            "user": self.user_edit.text().strip(),
-            "password": self.pass_edit.text().strip()
-        }
-
-
-# ---------------------------
 # Мост JS ↔ Python
 # ---------------------------
 class Bridge(QObject):
@@ -531,9 +149,6 @@ class Bridge(QObject):
                     )
 
 
-# ---------------------------
-# Главное окно
-# ---------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -764,9 +379,6 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-# ---------------------------
-# Точка входа
-# ---------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = MainWindow()
